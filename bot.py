@@ -1,15 +1,20 @@
+import os
 import sqlite3
 from datetime import datetime, date, timedelta, time
 import pytz
 from telegram import Update, Chat, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters, CallbackQueryHandler
+)
+from keep_alive import keep_alive
 
 # --- KONFIG ---
-TOKEN = "8251142947:AAFAvKawLlRBIqGuLv5CCn7V4jjZXEbPw20"
+TOKEN = os.getenv("TOKEN")  # Render.com da Environment Variable orqali beriladi
 TZ = pytz.timezone("Asia/Tashkent")
 DB_PATH = "locations.db"
 
-# --- DB ---
+# --- DB funksiyalar ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -92,7 +97,6 @@ def get_members(chat_id: int):
 def get_locations_in_interval(chat_id: int, ts_from_utc: datetime, ts_to_utc: datetime):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Faqat allowed foydalanuvchilarni hisobga olish
     cur.execute("""
         SELECT l.user_id, COUNT(*) 
         FROM locations l
@@ -113,20 +117,16 @@ def is_allowed(chat_id: int, user_id: int) -> bool:
     return bool(result)
 
 def toggle_allowed(chat_id: int, user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
     if is_allowed(chat_id, user_id):
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
         cur.execute("DELETE FROM allowed WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        conn.commit()
-        conn.close()
     else:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
         cur.execute("INSERT INTO allowed (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
-        conn.commit()
-        conn.close()
+    conn.commit()
+    conn.close()
 
-# --- Hisobot ---
+# --- Hisobot funksiyalar ---
 async def send_report(app, chat_id: int, start_hm: str, end_hm: str):
     today = date.today()
     start_local = TZ.localize(datetime.combine(today, datetime.strptime(start_hm, "%H:%M").time()))
@@ -136,7 +136,6 @@ async def send_report(app, chat_id: int, start_hm: str, end_hm: str):
     start_utc = start_local.astimezone(pytz.UTC)
     end_utc = end_local.astimezone(pytz.UTC)
 
-    # Allowed foydalanuvchilarni filterlash
     members = [m for m in get_members(chat_id) if is_allowed(chat_id, m[0])]
     sent_counts = dict(get_locations_in_interval(chat_id, start_utc, end_utc))
 
@@ -154,7 +153,6 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         end_utc = TZ.localize(datetime.combine(today, time(23,59,59))).astimezone(pytz.UTC)
         members = [m for m in get_members(chat_id) if is_allowed(chat_id, m[0])]
         sent_counts = dict(get_locations_in_interval(chat_id, start_utc, end_utc))
-
         text = f"📆 Kunlik hisobot ({today}):\n\n"
         for uid, username, first_name, last_name in members:
             name = username or f"{first_name or ''} {last_name or ''}".strip() or f"user_{uid}"
@@ -174,32 +172,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-
-    # Faqat admin/creator ishlata oladi
     member = await chat.get_member(user.id)
     if member.status not in ("administrator", "creator"):
         await update.message.reply_text("❌ Faqat admin/owner ishlata oladi.")
         return
-
-    # Guruh tekshiruvi
     if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
         await update.message.reply_text("Bu buyruq faqat guruhda ishlaydi.")
         return
-
-    # Guruhni saqlash
     save_group(chat.id, chat.title or "No title")
     await update.message.reply_text(f"✅ Guruh ro‘yxatga olindi! Chat ID: `{chat.id}`", parse_mode="Markdown")
 
-    # --- ADMIN va a'zolarni avtomatik ro'yxatga qo'shish ---
-    async for admin in chat.get_administrators():
-        register_member(chat.id, admin.user)
-
-    # Guruhdagi a'zolarni olish va ro'yxatga qo'shish (faqat cheklangan 100 a'zoga)
-    async for member in chat.get_members():
-        register_member(chat.id, member.user)
-
-
-# --- /report (HH:MM HH:MM) admin-only ---
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -207,26 +189,12 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if member.status not in ("administrator", "creator"):
         await update.message.reply_text("❌ Faqat admin/owner ishlata oladi.")
         return
-
     if len(context.args) != 2:
-        await update.message.reply_text(
-            "❌ Iltimos intervalni HH:MM HH:MM formatida kiriting.\nMisol: /report 08:00 09:30"
-        )
+        await update.message.reply_text("❌ Format: /report 08:00 09:30")
         return
-
     start_hm, end_hm = context.args
-    try:
-        datetime.strptime(start_hm, "%H:%M")
-        datetime.strptime(end_hm, "%H:%M")
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Noto‘g‘ri format. HH:MM HH:MM ko‘rinishida yozing.\nMisol: /report 08:00 09:30"
-        )
-        return
-
     await send_report(context.application, chat.id, start_hm, end_hm)
 
-# --- Lokatsiya qabul qilish ---
 async def any_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -241,7 +209,6 @@ async def any_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         save_location(chat.id, user.id, update.message.location.latitude, update.message.location.longitude, ts_utc)
         await update.message.reply_text("📍 Lokatsiya qabul qilindi!")
 
-# --- Allow toggle (admin-only) ---
 async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -276,20 +243,9 @@ async def allow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = username or f"{first_name or ''} {last_name or ''}".strip() or f"user_{m_uid}"
             mark = "✅" if is_allowed(chat.id, m_uid) else ""
             keyboard.append([InlineKeyboardButton(f"{name} {mark}", callback_data=f"allow_{m_uid}")])
-        await query.edit_message_text(text="✅ Ruxsat berish uchun tanlang:", reply_markup=InlineKeyboardMarkup(keyboard))
-# --- /daily admin-only ---
-async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    member = await chat.get_member(user.id)
-    if member.status not in ("administrator", "creator"):
-        await update.message.reply_text("❌ Faqat admin/owner ishlata oladi.")
-        return
-    await daily_report_job(context)
-    await update.message.reply_text("📆 Kunlik hisobot yuborildi!")
+        await query.edit_message_text("✅ Ruxsat berish uchun tanlang:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-
-# --- INTERVALS (misol) ---
+# --- Hisobot vaqtlarini belgilang ---
 INTERVALS = [
     ("08:00", "09:30", time(9, 30)),
     ("12:00", "14:00", time(14, 0)),
@@ -302,35 +258,24 @@ def make_job(start_hm, end_hm):
             await send_report(context.application, chat_id, start_hm, end_hm)
     return job
 
-# --- MAIN ---
 def main():
     init_db()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setgroup", setgroup_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
     app.add_handler(MessageHandler(filters.ALL, any_message_handler))
     app.add_handler(CallbackQueryHandler(allow_callback, pattern="^allow_"))
-    app.add_handler(CommandHandler("daily", daily_cmd))
 
-    # Interval hisobotlari
     for start_hm, end_hm, report_time in INTERVALS:
-        app.job_queue.run_daily(make_job(start_hm, end_hm), report_time, days=(0,1,2,3,4,5,6), name=f"report_{start_hm}_{end_hm}")
+        app.job_queue.run_daily(make_job(start_hm, end_hm), report_time)
 
-    # Kunlik hisobot 19:00
-    app.job_queue.run_daily(daily_report_job, time(19,0), days=(0,1,2,3,4,5,6), name="daily_report")
-
+    app.job_queue.run_daily(daily_report_job, time(19,0))
     print("🤖 Bot ishga tushdi...")
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
-from keep_alive import keep_alive
-
-if __name__ == "__main__":
     keep_alive()
     main()
-
